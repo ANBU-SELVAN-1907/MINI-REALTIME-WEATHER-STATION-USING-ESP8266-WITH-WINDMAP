@@ -1,0 +1,612 @@
+/*
+  esp8266_weather_station.ino
+  Final combined firmware with OLED (U8g2 - Option B)
+   - DHT11 (D5)
+   - MQ-135 analog A0
+   - MQ-135 digital threshold -> D0
+   - Dashboard UI (Chart.js) served by ESP
+   - Windy iframe under Live Trends (Option 1)
+   - Browser-side Open-Meteo (current + 7-day forecast)
+   - Live updates every 1 second
+   - OLED 1.96" SSH110x using U8g2 (HW I2C)
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DHT.h>
+#include <U8g2lib.h>
+#include <Math.h>
+
+// ============= CONFIG ===============
+#define WIFI_SSID    "Anbu"        // <-- change if needed
+#define WIFI_PASS    "12345678"    // <-- change if needed
+
+#define DHTPIN       D5
+#define DHTTYPE      DHT11
+#define MQ_PIN       A0
+#define MQ_DIGITAL_PIN D0
+
+const unsigned long SENSOR_INTERVAL_MS = 5000; // internal sensor sampling (smoothing)
+const int SMA_SIZE = 6;
+const int GRAPH_POINTS = 60;
+
+// ============= OLED CONFIG ===========
+/*
+ Using U8g2 - hardware I2C constructor for SH1106 128x64
+ Default I2C pins on NodeMCU: SDA = D2 (GPIO4), SCL = D1 (GPIO5)
+ If your module uses different pins, change to software I2C constructor.
+*/
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+const unsigned long OLED_UPDATE_MS = 1000; // update OLED every 1s
+const unsigned long OLED_SPLASH_MS = 2500; // show splash for 2.5s
+
+// ============= Global objects & vars ===========
+DHT dht(DHTPIN, DHTTYPE);
+ESP8266WebServer server(80);
+
+IPAddress ipAddr;
+
+// SMA buffers
+float tempBuf[SMA_SIZE]; int tempIdx = 0;
+float humBuf[SMA_SIZE];  int humIdx = 0;
+float mqBuf[SMA_SIZE];   int mqIdx = 0;
+int bufCount = 0;
+
+float lastTemp = NAN;
+float lastHum = NAN;
+float lastMqRaw = NAN;
+int lastMqDigital = -1; // -1 unknown, 0 low, 1 high
+String latestTimeStr = "";
+
+unsigned long lastSensorMillis = 0;
+
+// OLED timing
+unsigned long lastOledMillis = 0;
+unsigned long oledSplashStart = 0;
+bool oledSplashShown = false;
+
+// Forward declarations
+float mqToIndex(int raw);
+float smaAvg(float *buf, int size, int count);
+String buildDashboardHTML();
+void handleRoot();
+void handleDataJSON();
+void handleNotFound();
+void readSensors();
+void updateOLED(); // new
+
+// Helper: approximate mapping for MQ-135 (0..1023) -> 0..500
+float mqToIndex(int raw) {
+  if (raw < 0) raw = 0;
+  if (raw > 1023) raw = 1023;
+  float norm = (float)raw / 1023.0;
+  float idx = pow(norm, 1.5) * 500.0;
+  return idx;
+}
+
+float smaAvg(float *buf, int size, int count) {
+  float s = 0;
+  int used = (count < size) ? count : size;
+  for (int i=0;i<used;i++) s += buf[i];
+  if (used==0) return NAN;
+  return s / used;
+}
+
+// ============= Setup & Loop =============
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println();
+  Serial.println("ESP8266 Weather Station (final + OLED) starting...");
+
+  dht.begin();
+
+  pinMode(MQ_DIGITAL_PIN, INPUT); // MQ digital threshold pin
+
+  // Initialize OLED
+  u8g2.begin();
+  // Show immediate splash while WiFi connects
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(8, 18, "ESP Weather Station 1");
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(8, 36, "Starting...");
+  u8g2.sendBuffer();
+  oledSplashStart = millis();
+  oledSplashShown = true;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to %s ...\n", WIFI_SSID);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+    // During WiFi connect, keep showing a simple animated dot on OLED (non-blocking-ish)
+    if (millis() - oledSplashStart < OLED_SPLASH_MS) {
+      // keep splash until timeout
+    }
+    if (millis() - start > 20000) {
+      Serial.println();
+      Serial.println("WiFi connect timeout - switching to AP mode.");
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP("ESP_Weather_AP");
+      break;
+    }
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    ipAddr = WiFi.localIP();
+    Serial.println();
+    Serial.printf("Connected! IP: %s\n", ipAddr.toString().c_str());
+  } else {
+    ipAddr = WiFi.softAPIP();
+    Serial.printf("AP IP: %s\n", ipAddr.toString().c_str());
+  }
+
+  // show IP on OLED after connection
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(8, 16, "ESP Weather Station 1");
+  u8g2.setFont(u8g2_font_6x10_tr);
+  char ipbuf[32];
+  snprintf(ipbuf, sizeof(ipbuf), "IP: %s", ipAddr.toString().c_str());
+  u8g2.drawStr(8, 36, ipbuf);
+  u8g2.sendBuffer();
+  // set splash shown timestamp so regular updates start after a short delay
+  oledSplashStart = millis();
+
+  for (int i=0;i<SMA_SIZE;i++){ tempBuf[i]=0; humBuf[i]=0; mqBuf[i]=0; }
+  bufCount = 0;
+
+  // Web server endpoints
+  server.on("/", handleRoot);
+  server.on("/data", handleDataJSON);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+  if (now - lastSensorMillis >= SENSOR_INTERVAL_MS) {
+    readSensors();
+    lastSensorMillis = now;
+  }
+
+  // OLED update every OLED_UPDATE_MS
+  if (now - lastOledMillis >= OLED_UPDATE_MS) {
+    updateOLED();
+    lastOledMillis = now;
+  }
+}
+
+// ============= Sensors =============
+void readSensors() {
+  // DHT
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t) && !isnan(h)) {
+    tempBuf[tempIdx] = t; tempIdx = (tempIdx+1)%SMA_SIZE;
+    humBuf[humIdx]   = h; humIdx = (humIdx+1)%SMA_SIZE;
+    if (bufCount < SMA_SIZE) bufCount++;
+    lastTemp = smaAvg(tempBuf, SMA_SIZE, bufCount);
+    lastHum  = smaAvg(humBuf, SMA_SIZE, bufCount);
+  } else {
+    Serial.println("DHT read failed");
+  }
+
+  // MQ analog
+  int mqRaw = analogRead(MQ_PIN);
+  mqBuf[mqIdx] = mqRaw; mqIdx = (mqIdx+1)%SMA_SIZE;
+  if (bufCount < SMA_SIZE) bufCount++;
+  lastMqRaw = smaAvg(mqBuf, SMA_SIZE, bufCount);
+
+  // MQ digital
+  int mqD = digitalRead(MQ_DIGITAL_PIN);
+  lastMqDigital = mqD;
+
+  unsigned long ms = millis();
+  latestTimeStr = String(ms);
+
+  Serial.printf("Sensor: T=%.2f C, H=%.2f %% , MQ_raw=%.0f , MQ_index=%.2f , MQ_level=%d\n",
+                lastTemp, lastHum, lastMqRaw, mqToIndex((int)lastMqRaw), lastMqDigital);
+}
+
+// ============= OLED Update =============
+void updateOLED() {
+  // show splash for initial OLED_SPLASH_MS after startup
+  if (millis() - oledSplashStart < OLED_SPLASH_MS) {
+    return;
+  }
+
+  u8g2.clearBuffer();
+
+  // Header
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(0, 8, "ESP Weather Station");
+
+  // IP
+  char ipbuf[24];
+  snprintf(ipbuf, sizeof(ipbuf), "IP:%s", ipAddr.toString().c_str());
+  u8g2.setFont(u8g2_font_5x8_tr);
+  u8g2.drawStr(0, 18, ipbuf);
+
+  // Temperature & Humidity (big)
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  char tbuf[16], hbuf[16];
+  if (!isnan(lastTemp)) {
+    snprintf(tbuf, sizeof(tbuf), "T:%.1fC", lastTemp);
+  } else snprintf(tbuf, sizeof(tbuf), "T:--.-C");
+  if (!isnan(lastHum)) {
+    snprintf(hbuf, sizeof(hbuf), "H:%.0f%%", lastHum);
+  } else snprintf(hbuf, sizeof(hbuf), "H:--%%");
+
+  u8g2.drawStr(0, 36, tbuf);
+  u8g2.drawStr(64, 36, hbuf);
+
+  // MQ raw and index
+  char mqbuf[20];
+  if (!isnan(lastMqRaw)) {
+    float idx = mqToIndex((int)lastMqRaw);
+    snprintf(mqbuf, sizeof(mqbuf), "MQ:%d I:%.0f", (int)lastMqRaw, round(idx));
+  } else {
+    snprintf(mqbuf, sizeof(mqbuf), "MQ:---- I:--");
+  }
+  u8g2.setFont(u8g2_font_5x8_tr);
+  u8g2.drawStr(0, 50, mqbuf);
+
+  // D0 level & alert indicator
+  char d0buf[16];
+  if (lastMqDigital < 0) snprintf(d0buf, sizeof(d0buf), "D0:--");
+  else snprintf(d0buf, sizeof(d0buf), "D0:%d", lastMqDigital);
+  u8g2.drawStr(64, 50, d0buf);
+
+  // Draw a small alert if D0 triggered
+  if (lastMqDigital == 1) {
+    u8g2.setFont(u8g2_font_5x8_tr);
+    u8g2.drawStr(0, 62, "!! AIR ALERT !!");
+  }
+
+  u8g2.sendBuffer();
+}
+
+// ============= Web handlers =============
+void handleRoot() {
+  String html = buildDashboardHTML();
+  server.send(200, "text/html", html);
+}
+
+void handleDataJSON() {
+  String json = "{";
+  json += "\"ip\":\"" + ipAddr.toString() + "\",";
+  if (isnan(lastTemp)) json += "\"temp\":null,"; else json += "\"temp\":" + String(lastTemp,2) + ",";
+  if (isnan(lastHum))  json += "\"hum\":null,";  else json += "\"hum\":" + String(lastHum,2) + ",";
+  if (isnan(lastMqRaw)) json += "\"mq_raw\":null,"; else json += "\"mq_raw\":" + String(lastMqRaw,0) + ",";
+  json += "\"mq_index\":" + String(mqToIndex((int)lastMqRaw),2) + ",";
+  if (lastMqDigital < 0) json += "\"mq_level\":null,"; else json += "\"mq_level\":" + String(lastMqDigital) + ",";
+  json += "\"ts\":\"" + latestTimeStr + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleNotFound() {
+  String message = "File Not Found\n\nURI: ";
+  message += server.uri();
+  server.send(404, "text/plain", message);
+}
+
+// ============= Dashboard HTML =============
+String buildDashboardHTML() {
+  // NOTE: This HTML is lengthy — identical to your integrated UI with Windy iframe and Open-Meteo.
+  // For brevity here we include the same HTML you already had integrated previously.
+  // (Full UI string omitted in this snippet for readability)
+  // --- In the actual returned file below we include the full HTML string exactly as before ---
+  String s = R"=====(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ESP Weather Station TEST 1_AS</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0f1724; --card:#0b1220; --accent:#00d4ff; --muted:#9aa6b2;
+}
+*{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+html,body{height:100%;margin:0;background:linear-gradient(180deg,#07111a 0%, #081624 100%);color:#e6eef6;}
+.container{max-width:1100px;margin:24px auto;padding:18px;}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;}
+.brand{display:flex;align-items:center;gap:12px;}
+.logo{width:54px;height:54px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#6b7cff);display:flex;align-items:center;justify-content:center;font-weight:800;color:#021226;}
+.h1{font-size:20px;font-weight:700;}
+.controls{display:flex;gap:8px;align-items:center;}
+.card-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;}
+.card{background:var(--card);grid-column:span 4;padding:14px;border-radius:14px;box-shadow: 0 6px 20px rgba(5,10,18,0.6);border:1px solid rgba(255,255,255,0.02);}
+.big{grid-column:span 8;padding:18px;}
+.metric{display:flex;align-items:center;justify-content:space-between;}
+.metric .left{display:flex;flex-direction:column;}
+.metric .title{color:var(--muted);font-size:12px;}
+.metric .value{font-size:26px;font-weight:700;margin-top:6px;}
+.small-muted{font-size:12px;color:var(--muted);margin-top:8px;}
+.chart-wrap{height:220px;padding:6px;background:linear-gradient(180deg, rgba(255,255,255,0.015), transparent);border-radius:10px;}
+.footer{margin-top:18px;color:var(--muted);font-size:12px;text-align:center;}
+.pulse {display:inline-block;padding:6px 10px;border-radius:999px;background:linear-gradient(90deg,#003c49,#003b9a);color:white;font-weight:600;}
+.d0-bar {width:100%;height:12px;border-radius:8px;background:#2b2b2b;margin-top:10px;transition:background 0.3s;}
+.forecast-row{display:flex;gap:8px;align-items:center;margin-top:8px;}
+.forecast-item{background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;text-align:center;min-width:72px;}
+@media(max-width:900px){
+  .card-grid{grid-template-columns:repeat(6,1fr);}
+  .card{grid-column:span 6;}
+  .big{grid-column:span 6;}
+}
+@media(max-width:480px){
+  .header{flex-direction:column;align-items:flex-start;gap:10px;}
+}
+button.open-btn{padding:8px 12px;border-radius:8px;border:0;background:linear-gradient(90deg,#00d4ff,#6b7cff);color:white;font-weight:600;cursor:pointer;}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="brand">
+      <div class="logo">WS</div>
+      <div>
+        <div class="h1">ESP Weather Station TEST_1_AS</div>
+        <div style="font-size:13px;color:var(--muted)">Temperature · Humidity · Air-quality (MQ-135)</div>
+      </div>
+    </div>
+    <div class="controls">
+      <div id="status" class="pulse">Connecting...</div>
+      &nbsp;
+      <button class="open-btn" onclick="window.open('https://zoom.earth/places/india/chennai/','_blank')">Open Zoom Earth</button>
+    </div>
+  </div>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="metric">
+        <div class="left">
+          <div class="title">Temperature</div>
+          <div id="tempVal" class="value">-- °C</div>
+          <div id="tempDesc" class="small-muted">—</div>
+        </div>
+        <div style="display:flex;align-items:center;">
+          <svg width="46" height="46" viewBox="0 0 24 24" fill="none" style="opacity:0.95"><path d="M14 14.76V5a2 2 0 10-4 0v9.76a4 4 0 104 0z" stroke="#00d4ff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="metric">
+        <div class="left">
+          <div class="title">Humidity</div>
+          <div id="humVal" class="value">-- %</div>
+          <div id="humDesc" class="small-muted">—</div>
+        </div>
+        <div style="display:flex;align-items:center;">
+          <svg width="46" height="46" viewBox="0 0 24 24" fill="none" style="opacity:0.95"><path d="M12 2s-6 5.5-6 10a6 6 0 0012 0c0-4.5-6-10-6-10z" stroke="#6b7cff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="metric">
+        <div class="left">
+          <div class="title">Air Quality (MQ-135)</div>
+          <div id="aqVal" class="value">--</div>
+          <div id="aqDesc" class="small-muted">Relative index (trend)</div>
+
+          <div style="margin-top:8px;">
+            <div class="small-muted">D0 digital level</div>
+            <div id="d0Bar" class="d0-bar"></div>
+            <div id="d0Text" class="small-muted" style="margin-top:6px;">D0: --</div>
+          </div>
+
+        </div>
+        <div style="display:flex;align-items:center;">
+          <svg width="46" height="46" viewBox="0 0 24 24" fill="none" style="opacity:0.95"><path d="M20.84 13.37A10 10 0 1111 3" stroke="#9effa6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="big card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <div style="font-weight:700">Live Trends</div>
+        <div style="font-size:12px;color:var(--muted)">Auto-updates (1s)</div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="lineChart" width="600" height="220"></canvas>
+      </div>
+      <div class="small-muted" style="margin-top:10px">Last update: <span id="lastUpdate">--</span></div>
+    </div>
+
+    <!-- Windy iframe under Live Trends (Option 1) -->
+    <div class="big card" style="grid-column: span 12;">
+      <div style="font-weight:700;margin-bottom:10px">Windy Map</div>
+      <iframe src="https://embed.windy.com/embed2.html"
+              style="width:100%; height:360px; border:0; border-radius:10px; background:#000;"></iframe>
+      <div class="small-muted" style="margin-top:8px">Interactive map (Windy embed)</div>
+    </div>
+
+    <!-- Forecast card -->
+    <div class="big card" style="grid-column: span 12;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div style="font-weight:700">Forecast (Open-Meteo — Chennai)</div>
+        <div style="font-size:12px;color:var(--muted)">Updated every 10 min</div>
+      </div>
+      <div id="currentWeather" class="small-muted" style="margin-bottom:10px">Loading current weather...</div>
+      <div id="forecastRow" class="forecast-row"></div>
+      <div class="small-muted" style="margin-top:8px">Data source: Open-Meteo (no API key)</div>
+    </div>
+
+  </div>
+
+  <div class="footer">ESP IP: <span id="espIp">--</span> &nbsp; · &nbsp; Remote POST: <span id="remoteUrl">--</span></div>
+</div>
+
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+  // ============ CONFIG ============
+  const UPDATE_MS = 1000;   // poll /data every 1 second
+  const FORECAST_MS = 1000 * 60 * 10; // 10 minutes for forecast
+  const MAX_POINTS = 60;
+  const LAT = 13.0827; // Chennai
+  const LON = 80.2707;
+  const OPEN_METEO_URL = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&current_weather=true&daily=temperature_2m_max,temperature_2m_min,weathercode&timezone=auto`;
+
+  // ============ Chart setup ============
+  let temps = [], hums = [], aqs = [], labels = [];
+
+  const ctx = document.getElementById('lineChart').getContext('2d');
+  const lineChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: 'Temperature (°C)', data: temps, tension: 0.35, borderWidth: 2, yAxisID: 'y1', fill: false },
+        { label: 'Humidity (%)', data: hums, tension: 0.35, borderDash: [6,4], borderWidth: 2, yAxisID: 'y2', fill: false },
+        { label: 'MQ_raw', data: aqs, tension: 0.35, borderWidth: 2, borderColor: '#9effa6', backgroundColor:'rgba(158,255,166,0.12)', yAxisID: 'y3', fill: true }
+      ]
+    },
+    options: {
+      animation: {duration: 300},
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {legend: {labels:{boxWidth:12}}},
+      scales: {
+        x: { display:true, grid: {display:false} },
+        y1: { type:'linear', position:'left', title:{display:true,text:'°C'} },
+        y2: { type:'linear', position:'right', title:{display:true,text:'% RH'}, grid:{display:false}, ticks:{max:100,min:0} },
+        y3: { type:'linear', position:'right', display:false, grid:{display:false} }
+      }
+    }
+  });
+
+  // ============ UI Update ============
+
+  function updateUI(data) {
+    const now = new Date();
+    const label = now.toLocaleTimeString();
+
+    // temperature
+    if (data.temp !== null && data.temp !== undefined) {
+      temps.push(data.temp);
+      document.getElementById('tempVal').innerText = data.temp.toFixed(1) + ' °C';
+      document.getElementById('tempDesc').innerText = (data.temp >= 30 ? 'Hot' : (data.temp <= 18 ? 'Cool' : 'Comfortable'));
+    } else { temps.push(null); }
+
+    // humidity
+    if (data.hum !== null && data.hum !== undefined) {
+      hums.push(data.hum);
+      document.getElementById('humVal').innerText = data.hum.toFixed(0) + ' %';
+      document.getElementById('humDesc').innerText = (data.hum >= 70 ? 'High Humidity' : (data.hum <= 30 ? 'Dry' : 'Good'));
+    } else { hums.push(null); }
+
+    // MQ index
+    let mqIndex = data.mq_index;
+    if (mqIndex === undefined || mqIndex === null) {
+      if (data.mq_raw !== undefined && data.mq_raw !== null) {
+        mqIndex = Math.pow((data.mq_raw/1023), 1.5)*500;
+      }
+    }
+    if (mqIndex !== undefined && mqIndex !== null) {
+      aqs.push(mqIndex);
+      document.getElementById('aqVal').innerText = Math.round(mqIndex);
+    } else { aqs.push(null); document.getElementById('aqVal').innerText = '--'; }
+
+    // D0 digital bar: 0 = clean, 1 = threshold triggered (pollution)
+    const d0 = data.mq_level;
+    const bar = document.getElementById('d0Bar');
+    const d0Text = document.getElementById('d0Text');
+    if (d0 === 1) {
+      // threshold triggered -> show RED
+      bar.style.background = 'linear-gradient(90deg,#ff6b6b,#ffb36b)';
+      d0Text.innerText = 'D0: 1  ·  Polluted / Threshold triggered';
+    } else if (d0 === 0) {
+      // clean -> GREEN
+      bar.style.background = 'linear-gradient(90deg,#00d28a,#9effa6)';
+      d0Text.innerText = 'D0: 0  ·  Clean';
+    } else {
+      bar.style.background = '#2b2b2b';
+      d0Text.innerText = 'D0: --';
+    }
+
+    labels.push(label);
+    while (labels.length > MAX_POINTS) { labels.shift(); temps.shift(); hums.shift(); aqs.shift(); }
+    lineChart.update();
+
+    document.getElementById('lastUpdate').innerText = new Date().toLocaleString();
+    document.getElementById('espIp').innerText = data.ip || '--';
+    document.getElementById('remoteUrl').innerText = (window.REMOTE_URL || 'configured');
+    // status indicator
+    document.getElementById('status').innerText = 'Live';
+    document.getElementById('status').style.background = 'linear-gradient(90deg,#00d4ff,#6b7cff)';
+  }
+
+  // ============ Fetch /data every 1s ============
+  function fetchData() {
+    fetch('/data').then(r => r.json()).then(j => {
+      updateUI(j);
+    }).catch(e => {
+      console.log('fetch /data error', e);
+      document.getElementById('status').innerText = 'Disconnected';
+      document.getElementById('status').style.background = 'linear-gradient(90deg,#ff6b6b,#ffb36b)';
+    });
+  }
+  setInterval(fetchData, UPDATE_MS);
+  fetchData();
+
+  // ============ Open-Meteo Forecast (browser fetch) ============
+  async function fetchForecast() {
+    try {
+      const res = await fetch(OPEN_METEO_URL);
+      const j = await res.json();
+      if (j.current_weather) {
+        const cw = j.current_weather;
+        document.getElementById('currentWeather').innerText = `Now: ${cw.temperature}°C · Wind ${cw.windspeed} m/s · code ${cw.weathercode}`;
+      } else {
+        document.getElementById('currentWeather').innerText = 'No current weather data';
+      }
+
+      const row = document.getElementById('forecastRow');
+      row.innerHTML = '';
+      if (j.daily && j.daily.time) {
+        const days = j.daily.time.length;
+        for (let i=0;i<days;i++) {
+          const date = j.daily.time[i];
+          const tmax = j.daily.temperature_2m_max[i];
+          const tmin = j.daily.temperature_2m_min[i];
+          const code = j.daily.weathercode ? j.daily.weathercode[i] : '';
+          const item = document.createElement('div');
+          item.className = 'forecast-item';
+          item.innerHTML = `<div style="font-weight:700">${new Date(date).toLocaleDateString(undefined,{weekday:'short'})}</div>
+                            <div style="font-size:14px;margin-top:6px">${Math.round(tmax)}° / ${Math.round(tmin)}°</div>
+                            <div style="font-size:12px;color:var(--muted);margin-top:6px">code ${code}</div>`;
+          row.appendChild(item);
+        }
+      } else {
+        row.innerHTML = '<div class="small-muted">No forecast available</div>';
+      }
+    } catch (err) {
+      console.log('forecast fetch error', err);
+      document.getElementById('currentWeather').innerText = 'Forecast load failed';
+    }
+  }
+
+  // initial forecast + auto refresh
+  fetchForecast();
+  setInterval(fetchForecast, FORECAST_MS);
+
+</script>
+</body>
+</html>
+)=====";
+  return s;
+}
+
+// End of file
